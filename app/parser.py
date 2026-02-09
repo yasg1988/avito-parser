@@ -1,15 +1,14 @@
-"""HTTP client and data extraction from Avito pages.
+"""Browser-based data extraction from Avito pages.
 
-Extracts structured JSON from window.__staticRouterHydrationData
-embedded in Avito HTML pages.
+Uses Playwright (headed + Xvfb) to bypass datacenter IP blocking.
+Extracts structured JSON from window.__staticRouterHydrationData.
 """
 
 import re
 import json
 import logging
-from typing import Optional
 
-import httpx
+from playwright.async_api import async_playwright, Browser, BrowserContext
 
 from app.config import BASE_URL, CITY, USER_AGENT
 
@@ -21,18 +20,48 @@ HYDRATION_RE = re.compile(
     re.DOTALL,
 )
 
+# Shared browser instance
+_browser: Browser | None = None
+_context: BrowserContext | None = None
 
-def _get_client() -> httpx.AsyncClient:
-    return httpx.AsyncClient(
-        headers={
-            "User-Agent": USER_AGENT,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.5",
-            "Accept-Encoding": "gzip, deflate, br",
-        },
-        follow_redirects=True,
-        timeout=30.0,
+
+async def get_browser_context() -> BrowserContext:
+    """Get or create shared browser context."""
+    global _browser, _context
+    if _context:
+        return _context
+
+    p = await async_playwright().start()
+    _browser = await p.chromium.launch(
+        headless=False,
+        args=[
+            "--disable-blink-features=AutomationControlled",
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+        ],
     )
+    _context = await _browser.new_context(
+        user_agent=USER_AGENT,
+        locale="ru-RU",
+        viewport={"width": 1920, "height": 1080},
+    )
+    await _context.add_init_script("""
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    """)
+    logger.info("Browser context created")
+    return _context
+
+
+async def close_browser() -> None:
+    """Close shared browser."""
+    global _browser, _context
+    if _context:
+        await _context.close()
+        _context = None
+    if _browser:
+        await _browser.close()
+        _browser = None
 
 
 def _extract_hydration_data(html: str) -> dict | None:
@@ -50,11 +79,9 @@ def _extract_hydration_data(html: str) -> dict | None:
 def _get_loader_data(hydration: dict) -> dict | None:
     """Get loaderData from hydration structure."""
     loader = hydration.get("loaderData", {})
-    # Try common keys
     for key in ["catalog-or-main-or-item", "root"]:
         if key in loader:
             return loader[key]
-    # Return first available
     if loader:
         return next(iter(loader.values()))
     return None
@@ -74,13 +101,10 @@ def parse_search_page(html: str) -> list[dict]:
         return []
 
     items = []
-
-    # Try to find items in various possible structures
     search_result = loader.get("searchResult", {})
     raw_items = search_result.get("items", [])
 
     if not raw_items:
-        # Alternative path
         raw_items = loader.get("items", [])
 
     for item in raw_items:
@@ -90,7 +114,6 @@ def parse_search_page(html: str) -> list[dict]:
                 items.append(parsed)
         except Exception as e:
             logger.debug("Failed to parse search item: %s", e)
-            continue
 
     return items
 
@@ -140,13 +163,11 @@ def _parse_search_item(item: dict) -> dict | None:
     if not address:
         address = item.get("address") or item.get("location", {}).get("name")
 
-    # Extract URL path
     url_path = item.get("urlPath", "")
-
-    # Extract title parts
     title = item.get("title", "")
+
+    # Parse title "1-к. квартира, 37,5 м², 8/10 эт."
     rooms, area, floor_val, total_floors = None, None, None, None
-    # Try parsing "1-к. квартира, 37,5 м², 8/10 эт."
     title_match = re.match(r'(\d+)-к.*?(\d+[.,]?\d*)\s*м.*?(\d+)/(\d+)', title)
     if title_match:
         rooms = int(title_match.group(1))
@@ -190,12 +211,10 @@ def parse_listing_page(html: str) -> dict | None:
     if not item:
         return None
 
-    # Extract addressId from houseCatalogPageUrl
     address_id = None
     slug = None
     house_url = item.get("houseCatalogPageUrl", "")
     if house_url:
-        # /catalog/houses/yoshkar-ola/festivalnaya_ul_56/307170
         parts = house_url.rstrip("/").split("/")
         if len(parts) >= 2:
             try:
@@ -204,7 +223,6 @@ def parse_listing_page(html: str) -> dict | None:
             except ValueError:
                 pass
 
-    # Extract coordinates
     lat, lng = None, None
     geo = item.get("geo", {})
     if isinstance(geo, dict):
@@ -213,7 +231,6 @@ def parse_listing_page(html: str) -> dict | None:
             lat = coords.get("lat")
             lng = coords.get("lng")
 
-    # House params from listing
     house_params = {}
     hp = item.get("houseParams", {})
     if isinstance(hp, dict):
@@ -225,7 +242,6 @@ def parse_listing_page(html: str) -> dict | None:
             if title and description:
                 house_params[title] = description
 
-        # Rating
         rating_preview = hp_data.get("ratingPreview", {})
         if isinstance(rating_preview, dict):
             house_params["_rating"] = rating_preview.get("scoreValue")
@@ -246,7 +262,6 @@ def parse_listing_page(html: str) -> dict | None:
 
 # --- House catalog page parsing ---
 
-# Map Russian field names to DB columns
 HOUSE_FIELD_MAP = {
     "Год постройки": "build_year",
     "Этажей": "floors",
@@ -282,18 +297,12 @@ def parse_house_page(html: str) -> dict | None:
 
     result = {}
 
-    # Try to find house info in the loader data
-    # The structure varies - look for common patterns
     house_info = loader.get("houseInfo") or loader.get("house") or loader.get("aboutHouse")
-
     if isinstance(house_info, dict):
-        # Try structured data
         items = house_info.get("items", [])
         if isinstance(items, list):
             for item in items:
                 _extract_house_field(item, result)
-
-        # Try sections
         sections = house_info.get("sections", [])
         if isinstance(sections, list):
             for section in sections:
@@ -302,7 +311,6 @@ def parse_house_page(html: str) -> dict | None:
                     for item in sec_items:
                         _extract_house_field(item, result)
 
-    # Try alternative: aboutHouseBlock
     about_block = loader.get("aboutHouseBlock") or loader.get("aboutHouse")
     if isinstance(about_block, dict) and not result:
         sections = about_block.get("sections", [])
@@ -313,23 +321,19 @@ def parse_house_page(html: str) -> dict | None:
                     for item in sec_items:
                         _extract_house_field(item, result)
 
-    # Deep search: look for any key containing house characteristics
     if not result:
         result = _deep_search_house_fields(loader)
 
-    # Rating
     rating_data = loader.get("rating") or loader.get("houseRating")
     if isinstance(rating_data, dict):
         result["rating"] = rating_data.get("value") or rating_data.get("score")
         result["review_count"] = rating_data.get("count") or rating_data.get("reviewCount")
 
-    # Price range
     price_range = loader.get("priceRange") or loader.get("priceSummary")
     if isinstance(price_range, dict):
         result["price_min"] = price_range.get("min") or price_range.get("minPrice")
         result["price_max"] = price_range.get("max") or price_range.get("maxPrice")
 
-    # Active listings count
     listings_data = loader.get("listings") or loader.get("activeListings")
     if isinstance(listings_data, dict):
         result["active_listings"] = listings_data.get("total") or listings_data.get("count")
@@ -340,28 +344,21 @@ def parse_house_page(html: str) -> dict | None:
 
 
 def _extract_house_field(item: dict, result: dict) -> None:
-    """Extract a single house field from structured data."""
     title = item.get("title") or item.get("name") or item.get("label", "")
     value = item.get("value") or item.get("description") or item.get("text", "")
-
     if not title or not value:
         return
-
     db_field = HOUSE_FIELD_MAP.get(title)
     if db_field:
         result[db_field] = str(value)
 
 
 def _deep_search_house_fields(data: dict, depth: int = 0) -> dict:
-    """Recursively search for house fields in nested dict."""
     if depth > 5:
         return {}
-
     result = {}
-
     for key, val in data.items():
         if isinstance(val, dict):
-            # Check if this dict has title/value structure
             title = val.get("title") or val.get("name", "")
             value = val.get("value") or val.get("description", "")
             if title in HOUSE_FIELD_MAP and value:
@@ -377,48 +374,44 @@ def _deep_search_house_fields(data: dict, depth: int = 0) -> dict:
                         result[HOUSE_FIELD_MAP[title]] = str(value)
                     else:
                         result.update(_deep_search_house_fields(item, depth + 1))
-
     return result
 
 
-# --- HTTP fetch functions ---
+# --- Browser fetch functions ---
 
-async def fetch_search_page(client: httpx.AsyncClient, category_slug: str, page: int) -> str | None:
-    """Fetch a search results page."""
-    url = f"{BASE_URL}/{CITY}/kvartiry/{category_slug}?p={page}"
+async def fetch_page(url: str) -> str | None:
+    """Fetch a page using Playwright browser, return HTML content."""
     try:
-        resp = await client.get(url)
-        if resp.status_code == 200:
-            return resp.text
-        logger.warning("Search page %d returned %d", page, resp.status_code)
-        return None
+        ctx = await get_browser_context()
+        page = await ctx.new_page()
+        try:
+            resp = await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            if resp and resp.status == 200:
+                html = await page.content()
+                return html
+            status = resp.status if resp else "no response"
+            logger.warning("Page %s returned %s", url, status)
+            return None
+        finally:
+            await page.close()
     except Exception as e:
-        logger.error("Failed to fetch search page %d: %s", page, e)
+        logger.error("Failed to fetch %s: %s", url, e)
         return None
 
 
-async def fetch_listing_page(client: httpx.AsyncClient, url: str) -> str | None:
+async def fetch_search_page(category_slug: str, page_num: int) -> str | None:
+    """Fetch a search results page."""
+    url = f"{BASE_URL}/{CITY}/kvartiry/{category_slug}?p={page_num}"
+    return await fetch_page(url)
+
+
+async def fetch_listing_page(url: str) -> str | None:
     """Fetch a single listing page."""
     full_url = url if url.startswith("http") else f"{BASE_URL}{url}"
-    try:
-        resp = await client.get(full_url)
-        if resp.status_code == 200:
-            return resp.text
-        return None
-    except Exception as e:
-        logger.error("Failed to fetch listing %s: %s", url, e)
-        return None
+    return await fetch_page(full_url)
 
 
-async def fetch_house_page(client: httpx.AsyncClient, slug: str, address_id: int) -> str | None:
+async def fetch_house_page(slug: str, address_id: int) -> str | None:
     """Fetch a house catalog page."""
     url = f"{BASE_URL}/catalog/houses/{CITY}/{slug}/{address_id}"
-    try:
-        resp = await client.get(url)
-        if resp.status_code == 200:
-            return resp.text
-        logger.warning("House page %d returned %d", address_id, resp.status_code)
-        return None
-    except Exception as e:
-        logger.error("Failed to fetch house %d: %s", address_id, e)
-        return None
+    return await fetch_page(url)

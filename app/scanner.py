@@ -1,6 +1,7 @@
 """Scan orchestrator: Phase 1 (search listings) + Phase 2 (house details).
 
-Manages incremental scanning with progress tracking and resume support.
+Uses Playwright browser for fetching. Manages incremental scanning
+with progress tracking and resume support.
 """
 
 import asyncio
@@ -19,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 # Global scan state (thread-safe)
 scan_state = {
-    "status": "idle",  # idle / running / completed / error / stopped
+    "status": "idle",
     "phase": None,
     "category": None,
     "total_pages": 0,
@@ -98,19 +99,15 @@ async def run_full_scan(phase: str | None = None) -> None:
     scan_id = str(uuid.uuid4())[:8]
 
     try:
-        client = parser._get_client()
-        async with client:
-            # Phase 1: Scan search pages for listings
-            if phase in (None, "1"):
-                await _run_phase1(client, scan_id)
+        if phase in (None, "1"):
+            await _run_phase1(scan_id)
 
-            if _is_stop_requested():
-                _update_state(status="stopped", message="Scan stopped by user")
-                return
+        if _is_stop_requested():
+            _update_state(status="stopped", message="Scan stopped by user")
+            return
 
-            # Phase 2: Fetch house details for new houses
-            if phase in (None, "2"):
-                await _run_phase2(client, scan_id)
+        if phase in (None, "2"):
+            await _run_phase2(scan_id)
 
         final_status = "stopped" if _is_stop_requested() else "completed"
         _update_state(
@@ -123,13 +120,17 @@ async def run_full_scan(phase: str | None = None) -> None:
     except Exception as e:
         logger.error("Scan failed: %s", e)
         _update_state(status="error", message=f"Scan error: {e}")
+    finally:
+        try:
+            await parser.close_browser()
+        except Exception:
+            pass
 
 
-async def _run_phase1(client, scan_id: str) -> None:
+async def _run_phase1(scan_id: str) -> None:
     """Phase 1: Scan search pages, collect listings and addressIds."""
     _update_state(phase="phase1_search", message="Phase 1: Scanning search pages...")
 
-    # Collect all addressId -> slug mappings
     address_slugs: dict[int, str] = {}
 
     for cat_name, cat_slug in SEARCH_CATEGORIES.items():
@@ -146,7 +147,7 @@ async def _run_phase1(client, scan_id: str) -> None:
 
             _update_state(message=f"Phase 1: {cat_name} page {page}...")
 
-            html = await parser.fetch_search_page(client, cat_slug, page)
+            html = await parser.fetch_search_page(cat_slug, page)
             if not html:
                 consecutive_errors += 1
                 if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
@@ -158,26 +159,19 @@ async def _run_phase1(client, scan_id: str) -> None:
 
             items = parser.parse_search_page(html)
             if not items:
-                # No more results — end of pagination
                 logger.info("Category %s: no items on page %d, done", cat_name, page)
                 break
 
             consecutive_errors = 0
 
-            # Process items
             for item in items:
                 item_id = item.get("item_id")
                 if not item_id:
                     continue
 
-                # We need to visit the listing page to get addressId
-                # But first, save the listing from search results
                 listing_type = item.get("listing_type", "sale")
-                if cat_name == "rent":
-                    # Default to rent_long if not determined
-                    if listing_type == "sale":
-                        listing_type = "rent_long"
-
+                if cat_name == "rent" and listing_type == "sale":
+                    listing_type = "rent_long"
                 item["listing_type"] = listing_type
 
                 try:
@@ -194,25 +188,23 @@ async def _run_phase1(client, scan_id: str) -> None:
                 scan_id, "phase1", cat_name, page, "done", len(items)
             )
 
-            logger.info("Phase 1: %s page %d → %d items", cat_name, page, len(items))
-
+            logger.info("Phase 1: %s page %d -> %d items", cat_name, page, len(items))
             await asyncio.sleep(SCAN_DELAY_SEARCH)
             page += 1
 
-    # Now visit individual listing pages to collect addressIds
+    # Visit individual listing pages to collect addressIds
     _update_state(message="Phase 1: Collecting addressIds from listing pages...")
-    await _collect_address_ids(client, scan_id, address_slugs)
+    await _collect_address_ids(scan_id, address_slugs)
 
     logger.info("Phase 1 complete: %d address IDs collected", len(address_slugs))
 
 
-async def _collect_address_ids(client, scan_id: str, address_slugs: dict) -> None:
+async def _collect_address_ids(scan_id: str, address_slugs: dict) -> None:
     """Visit listing pages to extract addressId and slug."""
     pool = await database._ensure_pool()
     if not pool:
         return
 
-    # Get listings without address_id
     rows = await pool.fetch(f"""
         SELECT item_id, url FROM {database.SCHEMA}.listings
         WHERE address_id IS NULL AND url IS NOT NULL
@@ -238,7 +230,7 @@ async def _collect_address_ids(client, scan_id: str, address_slugs: dict) -> Non
         if idx % 50 == 0:
             _update_state(message=f"Phase 1: addressId {idx}/{total}...")
 
-        html = await parser.fetch_listing_page(client, url)
+        html = await parser.fetch_listing_page(url)
         if not html:
             consecutive_errors += 1
             if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
@@ -255,13 +247,11 @@ async def _collect_address_ids(client, scan_id: str, address_slugs: dict) -> Non
             slug = data.get("slug", "")
             address_slugs[aid] = slug
 
-            # Update listing with address_id
             await pool.execute(
                 f"UPDATE {database.SCHEMA}.listings SET address_id = $1 WHERE item_id = $2",
                 aid, item_id,
             )
 
-            # Pre-create house record with basic info
             house_data = {
                 "address_id": aid,
                 "slug": slug,
@@ -277,7 +267,7 @@ async def _collect_address_ids(client, scan_id: str, address_slugs: dict) -> Non
         await asyncio.sleep(SCAN_DELAY_SEARCH)
 
 
-async def _run_phase2(client, scan_id: str) -> None:
+async def _run_phase2(scan_id: str) -> None:
     """Phase 2: Fetch full details for houses without detailed data."""
     _update_state(phase="phase2_houses", message="Phase 2: Fetching house details...")
 
@@ -285,7 +275,6 @@ async def _run_phase2(client, scan_id: str) -> None:
     if not pool:
         return
 
-    # Get houses that lack detailed info
     rows = await pool.fetch(f"""
         SELECT address_id, slug FROM {database.SCHEMA}.houses
         WHERE build_year IS NULL AND house_type IS NULL
@@ -315,7 +304,7 @@ async def _run_phase2(client, scan_id: str) -> None:
             message=f"Phase 2: House {idx+1}/{total} (id={address_id})...",
         )
 
-        html = await parser.fetch_house_page(client, slug, address_id)
+        html = await parser.fetch_house_page(slug, address_id)
         if not html:
             consecutive_errors += 1
             _update_state(errors=scan_state["errors"] + 1)

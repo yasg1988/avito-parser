@@ -7,6 +7,7 @@ from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
 
 from app.database import init_db, close_db, get_house, get_houses, search_houses, get_listings, get_stats
 from app.models import ScanStatus, StatsResponse, MonitoringResponse
+from app.parser import close_browser
 from app.scanner import run_full_scan, get_scan_status, request_stop
 
 logging.basicConfig(
@@ -24,6 +25,7 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error("Failed to connect to database: %s", e)
     yield
+    await close_browser()
     await close_db()
 
 
